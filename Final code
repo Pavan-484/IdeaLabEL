@@ -1,0 +1,263 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// RFID
+#define SS_PIN 5
+#define RST_PIN 4
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// Outputs
+#define LOCK_PIN 25
+#define RED_LED 12
+#define GREEN_LED 14
+#define BUZZER 27
+
+// WiFi AP Credentials
+const char* ssid = "ESP32-LOCK";
+const char* password = "12345678";
+WebServer server(80);
+
+// UID & OTP Control
+String generatedOTP = "NULL";
+const String allowedUID = "2D442102";  // Replace with your actual tag UID
+bool otpVerified = false;
+bool waitingForOTP = false;
+bool rfidAccessLocked = false;
+bool manualLockState = false; // New manual lock flag
+
+// Invalid UID Logging
+#define MAX_INVALID_LOGS 5
+String invalidUIDs[MAX_INVALID_LOGS];
+unsigned long invalidTimestamps[MAX_INVALID_LOGS];
+int invalidLogIndex = 0;
+
+// ========== HTML Page ==========
+String htmlPageWithOTP(String otp) {
+  unsigned long currentMillis = millis();
+  String page = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>ESP32 RFID Lock</title>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+                "<style>"
+                "body { font-family: 'Segoe UI', sans-serif; background: #eef2f3; margin: 0; padding: 20px; font-size: 20px; }"
+                ".box { background: white; padding: 30px; border-radius: 12px; max-width: 500px; margin: auto; box-shadow: 0 0 10px rgba(0,0,0,0.1); }"
+                "h2 { color: #2c3e50; text-align: center; font-size: 28px; margin-bottom: 20px; }"
+                "p { font-size: 22px; text-align: center; }"
+                ".otp-box { font-size: 32px; font-weight: bold; background: #f7f7f7; padding: 10px; border-radius: 8px; margin: 10px auto; width: 120px; text-align: center; }"
+                "form { text-align: center; margin-bottom: 15px; }"
+                "input[type='text'] { width: 90%; padding: 12px; font-size: 18px; margin-bottom: 10px; }"
+                "input[type='submit'], button { padding: 14px 20px; font-size: 20px; border: none; border-radius: 6px; background: #3498db; color: white; cursor: pointer; }"
+                "input[type='submit']:hover, button:hover { background: #2980b9; }"
+                "ul { list-style-type: none; padding: 0; max-height: 150px; overflow-y: auto; background: #fff3f3; border-radius: 8px; font-size: 18px; }"
+                "li { padding: 8px; margin: 5px; border-left: 5px solid red; background: #ffeaea; font-weight: bold; }"
+                "a { display: block; text-align: center; margin-top: 15px; color: #555; font-size: 18px; }"
+                "</style></head><body><div class='box'>"
+                "<h2> ESP32 RFID Lock</h2>"
+                "<p>Current OTP:</p><div class='otp-box'>" + otp + "</div>"
+                "<form action='/verify'><input type='text' name='otp' maxlength='4' placeholder='Enter OTP'><br><input type='submit' value='Submit OTP'></form>"
+                "<form action='/lockrfid'><button>🔒 Lock RFID</button></form>"
+                "<form action='/unlockrfid'><button>🔓 Unlock RFID</button></form>"
+                "<form action='/clearlogs'><button>🧹 Clear Logs</button></form>"
+                "<form action='/locksolenoid'><button>🔒 Lock Solenoid</button></form>"
+                "<form action='/unlocksolenoid'><button>🔓 Unlock Solenoid</button></form>"
+                "<h3> Unauthorized Attempts:</h3><ul>";
+  for (int i = 0; i < MAX_INVALID_LOGS; i++) {
+    if (invalidUIDs[i] != "") {
+      unsigned long diff = currentMillis - invalidTimestamps[i];
+      page += "<li class='highlight'>" + invalidUIDs[i] + " (" + String(diff / 1000) + "s ago)</li>";
+    }
+  }
+  page += "</ul><a href='/'>Refresh</a></div></body></html>";
+  return page;
+}
+
+// ========== Web Handlers ==========
+void handleRoot() {
+  server.send(200, "text/html; charset=utf-8", htmlPageWithOTP(generatedOTP));
+}
+
+void handleVerify() {
+  if (server.hasArg("otp") && server.arg("otp") == generatedOTP) {
+    otpVerified = true;
+    server.send(200, "text/html; charset=utf-8", "<h2> OTP Verified. Door Unlocked.</h2><a href='/'>Back</a>");
+  } else {
+    server.send(200, "text/html; charset=utf-8", "<h2> Wrong OTP</h2><a href='/'>Back</a>");
+  }
+}
+
+void handleLockRFID() {
+  rfidAccessLocked = true;
+  server.send(200, "text/html; charset=utf-8", "<h2> RFID Access Locked</h2><a href='/'>Back</a>");
+}
+
+void handleUnlockRFID() {
+  rfidAccessLocked = false;
+  server.send(200, "text/html; charset=utf-8", "<h2> RFID Access Unlocked</h2><a href='/'>Back</a>");
+}
+
+void handleClearLogs() {
+  for (int i = 0; i < MAX_INVALID_LOGS; i++) {
+    invalidUIDs[i] = "";
+    invalidTimestamps[i] = 0;
+  }
+  invalidLogIndex = 0;
+  server.send(200, "text/html; charset=utf-8", "<h2> Logs Cleared</h2><a href='/'>Back</a>");
+}
+
+void handleManualLock() {
+  manualLockState = true;
+  digitalWrite(LOCK_PIN, LOW);
+  server.send(200, "text/html; charset=utf-8", "<h2>Solenoid Locked Manually</h2><a href='/'>Back</a>");
+}
+
+void handleManualUnlock() {
+  manualLockState = false;
+  digitalWrite(LOCK_PIN, HIGH);
+  server.send(200, "text/html; charset=utf-8", "<h2>Solenoid Unlocked Manually</h2><a href='/'>Back</a>");
+}
+
+// ========== WiFi ==========
+void startAccessPoint() {
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("Access Point IP: ");
+  Serial.println(IP);
+
+  server.on("/", handleRoot);
+  server.on("/verify", handleVerify);
+  server.on("/lockrfid", handleLockRFID);
+  server.on("/unlockrfid", handleUnlockRFID);
+  server.on("/clearlogs", handleClearLogs);
+  server.on("/locksolenoid", handleManualLock);
+  server.on("/unlocksolenoid", handleManualUnlock);
+  server.begin();
+}
+
+// ========== OTP ==========
+void generateOTP() {
+  generatedOTP = String(random(10000));
+  while (generatedOTP.length() < 4) generatedOTP = "0" + generatedOTP;
+  Serial.println("Generated OTP: " + generatedOTP);
+}
+
+// ========== Setup ==========
+void setup() {
+  Serial.begin(115200);
+  SPI.begin();
+  rfid.PCD_Init();
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(LOCK_PIN, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  digitalWrite(LOCK_PIN, LOW); // Start locked
+  digitalWrite(GREEN_LED, LOW);
+
+  manualLockState = true;
+
+  lcd.setCursor(0, 0);
+  lcd.print("RFID Lock Ready");
+  lcd.setCursor(0, 1);
+  lcd.print("Scan your card");
+
+  startAccessPoint();
+}
+
+// ========== Main Loop ==========
+void loop() {
+  server.handleClient();
+
+  if (!waitingForOTP) {
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+    String uid = "";
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      uid += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+      uid += String(rfid.uid.uidByte[i], HEX);
+    }
+    uid.toUpperCase();
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("UID:");
+    lcd.setCursor(0, 1);
+    lcd.print(uid);
+    delay(1500);
+
+    if (rfidAccessLocked) {
+      Serial.println(" RFID Blocked: " + uid);
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Access Locked");
+
+      for (int i = 0; i < 2; i++) {
+        digitalWrite(RED_LED, HIGH);
+        digitalWrite(BUZZER, HIGH);
+        delay(300);
+        digitalWrite(RED_LED, LOW);
+        digitalWrite(BUZZER, LOW);
+        delay(300);
+      }
+    }
+    else if (uid == allowedUID) {
+      generateOTP();
+      waitingForOTP = true;
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("OTP via Web");
+      lcd.setCursor(0, 1);
+      lcd.print("Connect WiFi");
+    }
+    else {
+      Serial.println(" Invalid UID: " + uid);
+      invalidUIDs[invalidLogIndex] = uid;
+      invalidTimestamps[invalidLogIndex] = millis();
+      invalidLogIndex = (invalidLogIndex + 1) % MAX_INVALID_LOGS;
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Access Denied");
+
+      digitalWrite(RED_LED, HIGH);
+      digitalWrite(BUZZER, HIGH);
+      delay(5000);
+      digitalWrite(RED_LED, LOW);
+      digitalWrite(BUZZER, LOW);
+    }
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+  }
+
+  if (waitingForOTP) {
+    if (otpVerified) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("OTP Verified");
+      lcd.setCursor(0, 1);
+      lcd.print("Unlocking...");
+
+      digitalWrite(LOCK_PIN, HIGH);
+      digitalWrite(GREEN_LED, HIGH);
+      delay(5000);
+      digitalWrite(LOCK_PIN, LOW);
+      digitalWrite(GREEN_LED, LOW);
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Scan your card");
+
+      otpVerified = false;
+      waitingForOTP = false;
+      generatedOTP = "NULL";
+    }
+  }
+}
